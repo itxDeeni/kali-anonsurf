@@ -1,0 +1,13 @@
+[Unit]
+Description=AnonSurf transparent Tor proxy
+After=network.target tor.service
+Wants=tor.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/etc/init.d/anonsurf start --no-kill --no-wipe
+ExecStop=/etc/init.d/anonsurf stop
+
+[Install]
+WantedBy=multi-user.target

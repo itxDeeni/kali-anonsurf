@@ -40,336 +40,657 @@
 export BLUE='\033[1;94m'
 export GREEN='\033[1;92m'
 export RED='\033[1;91m'
+export YELLOW='\033[1;93m'
 export RESETCOLOR='\033[1;00m'
 
-# Destinations you don't want routed through Tor
-TOR_EXCLUDE="192.168.0.0/16 172.16.0.0/12 10.0.0.0/8"
-
-# The UID Tor runs as
-# change it if, starting tor, the command 'ps -e | grep tor' returns a different UID
+# Default configuration (overridable by config file)
 TOR_UID="debian-tor"
-
-# Tor's TransPort
 TOR_PORT="9040"
+TOR_SOCKS_PORT="9050"
+TOR_DNS_PORT="53"
+TOR_EXCLUDE="192.168.0.0/16 172.16.0.0/12 10.0.0.0/8"
+DNS_SERVERS="127.0.0.1"
+DNS_FALLBACK="209.222.18.222 209.222.18.218"
+KILL_APPS="chrome dropbox iceweasel skype icedove thunderbird firefox chromium xchat transmission deluge pidgin pidgin.orig"
+BLEACHBIT_CLEANERS="adobe_reader.cache chromium.cache chromium.current_session chromium.history elinks.history emesene.cache epiphany.cache firefox.url_history flash.cache flash.cookies google_chrome.cache google_chrome.history links2.history opera.cache opera.search_history opera.url_history"
+DISABLE_IPV6=true
+MAC_SPOOF=false
+MAC_INTERFACES="eth0 wlan0"
+TOR_BRIDGES=""
+LOG_ENABLED=true
+LOG_FILE="/var/log/anonsurf.log"
+LOCK_FILE="/var/lock/anonsurf"
+CONFIG_FILE="/etc/anonsurf/anonsurf.conf"
+
+# Flags
+NO_KILL=false
+NO_WIPE=false
+
+# Source configuration if it exists
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+fi
 
 # Is resolvconf installed?
-if [[ ! -z `dpkg -l |grep resolvconf` ]]; then 
-	resolvconf_support=true;
+if dpkg -l 2>/dev/null | grep -q resolvconf; then
+    resolvconf_support=true
 else
-	resolvconf_support=false;
+    resolvconf_support=false
 fi
 
 
+# === Helper Functions ===
+
+function log {
+    if [ "$LOG_ENABLED" = true ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+    fi
+}
+
+function check_root {
+    if [ $(id -u) -ne 0 ]; then
+        echo -e "\n$GREEN[$RED!$GREEN] $RED This script must be run as root$RESETCOLOR\n" >&2
+        exit 1
+    fi
+}
+
+function create_lock {
+    if [ -f "$LOCK_FILE" ]; then
+        echo -e "$RED AnonSurf is already running (lockfile exists at $LOCK_FILE)$RESETCOLOR" >&2
+        echo -e "$RED If this is incorrect, remove $LOCK_FILE and try again$RESETCOLOR" >&2
+        exit 1
+    fi
+    touch "$LOCK_FILE"
+    log "Lock created at $LOCK_FILE"
+}
+
+function remove_lock {
+    rm -f "$LOCK_FILE"
+    log "Lock removed from $LOCK_FILE"
+}
+
+function save_network_state {
+    log "Saving network state"
+
+    iptables-save > /etc/network/iptables.rules
+    echo -e " $GREEN*$BLUE Saved iptables rules$RESETCOLOR"
+
+    if [ "$resolvconf_support" = false ]; then
+        [ -f /etc/resolv.conf ] && cp /etc/resolv.conf /etc/resolv.conf.bak
+    else
+        if [ -f /etc/resolvconf/resolv.conf.d/head ]; then
+            cp /etc/resolvconf/resolv.conf.d/head /etc/resolvconf/resolv.conf.d/head.bak
+        fi
+    fi
+}
+
+function restore_network_state {
+    log "Restoring network state"
+
+    iptables -F
+    iptables -t nat -F
+
+    if [ -f /etc/network/iptables.rules ]; then
+        iptables-restore < /etc/network/iptables.rules
+        rm /etc/network/iptables.rules
+        echo -e " $GREEN*$BLUE Iptables rules restored$RESETCOLOR"
+    fi
+
+    if [ "$resolvconf_support" = false ]; then
+        if [ -f /etc/resolv.conf.bak ]; then
+            rm /etc/resolv.conf
+            cp /etc/resolv.conf.bak /etc/resolv.conf
+        fi
+    else
+        if [ -f /etc/resolvconf/resolv.conf.d/head.bak ]; then
+            mv /etc/resolvconf/resolv.conf.d/head.bak /etc/resolvconf/resolv.conf.d/head
+            resolvconf -u
+        fi
+    fi
+
+    log "Network state restored"
+}
+
+function configure_dns {
+    local dns_line=""
+    for ns in $DNS_SERVERS; do
+        [ -n "$dns_line" ] && dns_line="$dns_line\n"
+        dns_line="${dns_line}nameserver $ns"
+    done
+    for ns in $DNS_FALLBACK; do
+        [ -n "$dns_line" ] && dns_line="$dns_line\n"
+        dns_line="${dns_line}nameserver $ns"
+    done
+
+    if [ "$resolvconf_support" = false ]; then
+        touch /etc/resolv.conf
+        echo -e "$dns_line" > /etc/resolv.conf
+        echo -e " $GREEN*$BLUE Modified resolv.conf to use Tor and fallback DNS$RESETCOLOR"
+    else
+        echo -e "$dns_line" >> /etc/resolvconf/resolv.conf.d/head
+        echo -e " $GREEN*$BLUE Modified resolvconf to use Tor and fallback DNS$RESETCOLOR"
+        resolvconf -u
+    fi
+
+    log "DNS configured: $DNS_SERVERS $DNS_FALLBACK"
+}
+
+
+# === Core Functions ===
+
 function init {
-	echo -e -n " $GREEN*$BLUE killing dangerous applications$RESETCOLOR\n"
-	killall -q chrome dropbox iceweasel skype icedove thunderbird firefox chromium xchat transmission deluge pidgin pidgin.orig
-	
-	echo -e -n " $GREEN*$BLUE cleaning some dangerous cache elements"
-	bleachbit -c adobe_reader.cache chromium.cache chromium.current_session chromium.history elinks.history emesene.cache epiphany.cache firefox.url_history flash.cache flash.cookies google_chrome.cache google_chrome.history  links2.history opera.cache opera.search_history opera.url_history &> /dev/null
+    if [ "$NO_KILL" = false ]; then
+        echo -e " $GREEN*$BLUE Killing dangerous applications$RESETCOLOR"
+        killall -q $KILL_APPS
+        log "Killed applications: $KILL_APPS"
+    else
+        echo -e " $YELLOW*$BLUE Skipping application kill (--no-kill)$RESETCOLOR"
+        log "Skipped application kill (--no-kill)"
+    fi
+
+    if [ "$NO_WIPE" = false ]; then
+        echo -e " $GREEN*$BLUE Cleaning dangerous cache elements$RESETCOLOR"
+        if command -v bleachbit > /dev/null; then
+            bleachbit -c $BLEACHBIT_CLEANERS &> /dev/null
+            log "Bleachbit cleaners run"
+        else
+            echo -e " $YELLOW*$BLUE bleachbit not installed, skipping cache cleaning$RESETCOLOR"
+            log "bleachbit not available, skipped cache cleaning"
+        fi
+    else
+        echo -e " $YELLOW*$BLUE Skipping cache cleaning (--no-wipe)$RESETCOLOR"
+        log "Skipped cache cleaning (--no-wipe)"
+    fi
 }
 
 
-function starti2p {
-	echo -e -n " $GREEN*$BLUE starting I2P services$RESETCOLOR\n"
-	service tor stop
+function disable_ipv6 {
+    if [ "$DISABLE_IPV6" = false ]; then
+        log "IPv6 disabling skipped per configuration"
+        return 0
+    fi
 
-	# Modify DNS settings
-	if [ "$resolvconf_support" = false ] 
-	then
-		cp /etc/resolv.conf /etc/resolv.conf.bak;
-		touch /etc/resolv.conf;
-		echo -e 'nameserver 127.0.0.1\nnameserver 209.222.18.222\nnameserver 209.222.18.218' > /etc/resolv.conf;
-		echo -e " $GREEN*$BLUE Modified resolv.conf to use localhost and Private Internet Access DNS$RESETCOLOR\n";
-	else
-		cp /etc/resolvconf/resolv.conf.d/head{,.bak};
-		echo -e 'nameserver 127.0.0.1\nnameserver 209.222.18.222\nnameserver 209.222.18.218' >> /etc/resolvconf/resolv.conf.d/head;
-		echo -e " $GREEN*$BLUE Modified resolvconf to use localhost and Private Internet Access DNS$RESETCOLOR\n";
-		resolvconf -u;
-	fi
-	sudo -u i2psvc i2prouter start
-	sleep 2
-	xdg-open 'http://127.0.0.1:7657/home'
-}
-
-function stopi2p {
-	echo -e -n " $GREEN*$BLUE stopping I2P services\n$RESETCOLOR"
-	sudo -u i2psvc i2prouter stop
-	
-	# restore DNS settings
-	if [ "$resolvconf_support" = false ] 
-	then
-		if [ -e /etc/resolv.conf.bak ]; then
-			rm /etc/resolv.conf
-			cp /etc/resolv.conf.bak /etc/resolv.conf
-		fi
-	else
-		mv /etc/resolvconf/resolv.conf.d/head{.bak,}
-		resolvconf -u
-	fi
-}
-
-function disable_ipv6() {
     echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Stopping IPv6 services:$RESETCOLOR\n"
 
-    # Remove current IPv6 settings if it exists
     if [ -f /etc/sysctl.d/98-kali-anonsurf.conf ]; then
         rm /etc/sysctl.d/98-kali-anonsurf.conf
     fi
 
-    # Add comprehensive IPv6 disable configuration
-    cat << EOF >> /etc/sysctl.d/98-kali-anonsurf.conf
+    cat << EOF > /etc/sysctl.d/98-kali-anonsurf.conf
 # Disable IPv6 - Added by kali-anonsurf
 net.ipv6.conf.all.disable_ipv6 = 1 #kali-anonsurf
 net.ipv6.conf.default.disable_ipv6 = 1 #kali-anonsurf
 net.ipv6.conf.lo.disable_ipv6 = 1 #kali-anonsurf
 EOF
 
-    # Apply settings
     if ! sysctl -p /etc/sysctl.d/98-kali-anonsurf.conf > /dev/null; then
         echo -e "$RED Error applying sysctl settings$RESETCOLOR"
+        log "Error applying sysctl settings"
         return 1
     fi
 
-    # Verify IPv6 is disabled
-    if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != "1" ]; then
+    if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != "1" ]; then
         echo -e "$RED Failed to disable IPv6$RESETCOLOR"
+        log "Failed to disable IPv6"
         return 1
     fi
 
     echo -e "$GREEN IPv6 successfully disabled$RESETCOLOR"
+    log "IPv6 disabled"
     return 0
 }
 
-function enable_ipv6() {
-    echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Reenabling IPv6 services:$RESETCOLOR\n"
-
-    # Remove the config file if it exists
-    if [ -f /etc/sysctl.d/98-kali-anonsurf ]; then
-        rm -f /etc/sysctl.d/98-kali-anonsurf.conf
-		echo -e "$GREEN Removed anonsurf sysctl config$RESETCOLOR"
+function enable_ipv6 {
+    if [ "$DISABLE_IPV6" = false ]; then
+        log "IPv6 re-enabling skipped per configuration"
+        return 0
     fi
 
-    # Reload all sysctl settings
+    echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Reenabling IPv6 services:$RESETCOLOR\n"
+
+    if [ -f /etc/sysctl.d/98-kali-anonsurf.conf ]; then
+        rm -f /etc/sysctl.d/98-kali-anonsurf.conf
+        echo -e "$GREEN Removed anonsurf sysctl config$RESETCOLOR"
+    fi
+
     if ! sysctl --system > /dev/null; then
         echo -e "$RED Error reloading sysctl settings$RESETCOLOR"
+        log "Error reloading sysctl settings"
         return 1
     fi
 
-    # Verify IPv6 is enabled
-    if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != "0" ]; then
+    local ipv6_disabled ipv6_ok=true
+    ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)
+    if [ "$ipv6_disabled" != "0" ]; then
         echo -e "$RED Failed to forcibly reenable IPv6$RESETCOLOR"
-        # return 1
+        log "Failed to re-enable IPv6"
+        ipv6_ok=false
     fi
 
-    # Restart network services
     service network-manager force-reload > /dev/null 2>&1
     service nscd start > /dev/null 2>&1
     service dnsmasq start > /dev/null 2>&1
 
-    echo -e "$GREEN IPv6 successfully enabled$RESETCOLOR"
+    if [ "$ipv6_ok" = true ]; then
+        echo -e "$GREEN IPv6 successfully enabled$RESETCOLOR"
+    fi
+    log "IPv6 enabled"
     return 0
 }
 
 
-function ip {
+function spoof_mac {
+    if [ "$MAC_SPOOF" != true ]; then
+        return 0
+    fi
 
-	echo -e "\nMy ip is:\n"
-	sleep 1
-	curl "https://api.ipify.org" # Decent provider serving 30b requests/month, and doesn't block TOR
-	echo -e "\n\n----------------------------------------------------------------------"
+    if ! command -v macchanger > /dev/null; then
+        echo -e " $YELLOW*$BLUE macchanger not installed, skipping MAC spoofing$RESETCOLOR"
+        log "macchanger not installed, skipped MAC spoofing"
+        return 0
+    fi
+
+    echo -e " $GREEN*$BLUE Randomizing MAC addresses$RESETCOLOR"
+    for iface in $MAC_INTERFACES; do
+        if ip link show "$iface" > /dev/null 2>&1; then
+            ip link set "$iface" down
+            macchanger -r "$iface" > /dev/null 2>&1
+            ip link set "$iface" up
+            echo -e " $GREEN*$BLUE MAC randomized for $iface$RESETCOLOR"
+            log "MAC randomized for $iface"
+        fi
+    done
 }
+
+function restore_mac {
+    if [ "$MAC_SPOOF" != true ]; then
+        return 0
+    fi
+
+    if ! command -v macchanger > /dev/null; then
+        return 0
+    fi
+
+    echo -e " $GREEN*$BLUE Restoring MAC addresses$RESETCOLOR"
+    for iface in $MAC_INTERFACES; do
+        if ip link show "$iface" > /dev/null 2>&1; then
+            ip link set "$iface" down
+            macchanger -p "$iface" > /dev/null 2>&1
+            ip link set "$iface" up
+            echo -e " $GREEN*$BLUE MAC restored for $iface$RESETCOLOR"
+            log "MAC restored for $iface"
+        fi
+    done
+}
+
+
+function configure_tor_bridges {
+    if [ -z "$TOR_BRIDGES" ]; then
+        return 0
+    fi
+
+    echo -e " $GREEN*$BLUE Configuring Tor bridges$RESETCOLOR"
+    log "Configuring Tor bridges"
+
+    if ! grep -q "^UseBridges 1" /etc/tor/torrc 2>/dev/null; then
+        echo "UseBridges 1" >> /etc/tor/torrc
+    fi
+
+    local saved_ifs="$IFS"
+    IFS='|'
+    for bridge in $TOR_BRIDGES; do
+        bridge=$(echo "$bridge" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$bridge" ] && continue
+        if ! grep -Fq "Bridge $bridge" /etc/tor/torrc 2>/dev/null; then
+            echo "Bridge $bridge" >> /etc/tor/torrc
+            log "Added bridge: $bridge"
+        fi
+    done
+    IFS="$saved_ifs"
+}
+
+
+function check_tor_connectivity {
+    echo -e " $GREEN*$BLUE Verifying Tor connectivity...$RESETCOLOR"
+    log "Verifying Tor connectivity"
+
+    local IPCHECK_URL="${IPCHECK_URL:-https://check.torproject.org/api/ip}"
+
+    local tor_ip
+    tor_ip=$(curl --socks5-hostname "127.0.0.1:$TOR_SOCKS_PORT" -s --max-time 15 "$IPCHECK_URL" 2>/dev/null | grep -o '"IP":"[^"]*"' | cut -d'"' -f4)
+
+    if [ -n "$tor_ip" ]; then
+        echo -e " $GREEN*$BLUE Tor is working. External IP: $tor_ip$RESETCOLOR"
+        log "Tor verified. IP: $tor_ip"
+        return 0
+    else
+        echo -e " $RED*$BLUE WARNING: Could not verify Tor connectivity$RESETCOLOR"
+        echo -e " $RED*$BLUE Your traffic may not be anonymized!$RESETCOLOR"
+        log "WARNING: Tor connectivity check failed"
+        return 1
+    fi
+}
+
+
+function dns_leak_test {
+    echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Running DNS leak test:$RESETCOLOR\n"
+
+    local IPCHECK_URL="${IPCHECK_URL:-https://ipinfo.io/json}"
+
+    local tor_ip
+    tor_ip=$(curl --socks5-hostname "127.0.0.1:$TOR_SOCKS_PORT" -s --max-time 15 "$IPCHECK_URL" 2>/dev/null | grep -o '"ip":"[^"]*"' | cut -d'"' -f4)
+
+    local direct_ip
+    direct_ip=$(curl -s --max-time 15 "$IPCHECK_URL" 2>/dev/null | grep -o '"ip":"[^"]*"' | cut -d'"' -f4)
+
+    echo -e " $GREEN*$BLUE Tor IP: $YELLOW${tor_ip:-Unknown}$RESETCOLOR"
+    echo -e " $GREEN*$BLUE Direct IP: $YELLOW${direct_ip:-Unknown}$RESETCOLOR"
+
+    if [ -z "$tor_ip" ]; then
+        echo -e " $RED*$BLUE Cannot determine Tor IP — Tor may not be working$RESETCOLOR"
+        log "DNS leak test: Tor IP unknown"
+    elif [ "$tor_ip" != "$direct_ip" ] && [ -n "$direct_ip" ]; then
+        echo -e " $GREEN*$BLUE No DNS leak detected (IPs differ)$RESETCOLOR"
+        log "DNS leak test: No leak detected"
+    elif [ -z "$direct_ip" ]; then
+        echo -e " $GREEN*$BLUE Direct connection blocked — all traffic through Tor$RESETCOLOR"
+        log "DNS leak test: Direct connection blocked"
+    else
+        echo -e " $RED*$BLUE WARNING: Possible DNS leak detected (IPs match)!$RESETCOLOR"
+        log "DNS leak test: WARNING — possible leak"
+        return 1
+    fi
+
+    return 0
+}
+
+
+function add_rule {
+    iptables "$@" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo -e " $RED*$BLUE Failed to set iptables rule, rolling back...$RESETCOLOR"
+        log "ERROR: iptables rule failed: iptables $*"
+        restore_network_state
+        exit 1
+    fi
+}
+
 
 function start {
-	# Make sure only root can run this script
-	if [ $(id -u) -ne 0 ]; then
-		echo -e -e "\n$GREEN[$RED!$GREEN] $RED This script must be run as root$RESETCOLOR\n" >&2
-		exit 1
-	fi
-	
-	# Check defaults for Tor
-	grep -q -x 'RUN_DAEMON="yes"' /etc/default/tor
-	if [ $? -ne 0 ]; then
-		echo -e "\n$GREEN[$RED!$GREEN]$RED Please add the following to your /etc/default/tor and restart service:$RESETCOLOR\n" >&2
-		echo -e "$BLUE#----------------------------------------------------------------------#$RESETCOLOR"
-		echo -e 'RUN_DAEMON="yes"'
-		echo -e "$BLUE#----------------------------------------------------------------------#$RESETCOLOR\n"
-		exit 1
-	fi	
-	
-	disable_ipv6
+    check_root
 
-	echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Starting anonymous mode:$RESETCOLOR\n"
-	
-	if [ ! -e /var/run/tor/tor.pid ]; then
-		echo -e " $RED*$BLUE Tor is not running! $GREEN starting it $BLUE for you$RESETCOLOR\n" >&2
-		service network-manager force-reload > /dev/null 2>&1
-		killall dnsmasq > /dev/null 2>&1
-		killall nscd > /dev/null 2>&1	
-		service tor start
-		sleep 1
-	fi
-	if ! [ -f /etc/network/iptables.rules ]; then
-		iptables-save > /etc/network/iptables.rules
-		echo -e " $GREEN*$BLUE Saved iptables rules$RESETCOLOR\n"
-	fi
-	
-	iptables -F
-	iptables -t nat -F
-	
-	if [ "$resolvconf_support" = false ] 
-	then
-		cp /etc/resolv.conf /etc/resolv.conf.bak
-		touch /etc/resolv.conf
-		echo -e 'nameserver 127.0.0.1\nnameserver 209.222.18.222\nnameserver 209.222.18.218' > /etc/resolv.conf
-		echo -e " $GREEN*$BLUE Modified resolv.conf to use Tor and Private Internet Access DNS"
-	else
-		cp /etc/resolvconf/resolv.conf.d/head{,.bak}
-                echo -e 'nameserver 127.0.0.1\nnameserver 209.222.18.222\nnameserver 209.222.18.218' >> /etc/resolvconf/resolv.conf.d/head
-                echo -e " $GREEN*$BLUE Modified resolvconf to use localhost and Private Internet Access DNS$RESETCOLOR\n"
-                resolvconf -u
-	fi
+    if [ -f "$LOCK_FILE" ]; then
+        echo -e "$RED AnonSurf is already running (lockfile exists at $LOCK_FILE)$RESETCOLOR" >&2
+        echo -e "$RED Run 'anonsurf stop' first or remove $LOCK_FILE$RESETCOLOR" >&2
+        exit 1
+    fi
 
-	# set iptables nat
-	iptables -t nat -A OUTPUT -m owner --uid-owner $TOR_UID -j RETURN
-	iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53
-	iptables -t nat -A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports 53
-	iptables -t nat -A OUTPUT -p udp -m owner --uid-owner $TOR_UID -m udp --dport 53 -j REDIRECT --to-ports 53
-	
-	#resolve .onion domains mapping 10.192.0.0/10 address space
-	iptables -t nat -A OUTPUT -p tcp -d 10.192.0.0/10 -j REDIRECT --to-ports 9040
-	iptables -t nat -A OUTPUT -p udp -d 10.192.0.0/10 -j REDIRECT --to-ports 9040
-	
-	#exclude local addresses
-	for NET in $TOR_EXCLUDE 127.0.0.0/9 127.128.0.0/10; do
-		iptables -t nat -A OUTPUT -d $NET -j RETURN
-	done
-	
-	#redirect all other output through TOR
-	iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports $TOR_PORT
-	iptables -t nat -A OUTPUT -p udp -j REDIRECT --to-ports $TOR_PORT
-	iptables -t nat -A OUTPUT -p icmp -j REDIRECT --to-ports $TOR_PORT
-	
-	#accept already established connections
-	iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-	
-	#exclude local addresses
-	for NET in $TOR_EXCLUDE 127.0.0.0/8; do
-		iptables -A OUTPUT -d $NET -j ACCEPT
-	done
-	
-	#allow only tor output
-	iptables -A OUTPUT -m owner --uid-owner $TOR_UID -j ACCEPT
-	iptables -A OUTPUT -j REJECT
+    grep -q -x 'RUN_DAEMON="yes"' /etc/default/tor 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo -e "\n$GREEN[$RED!$GREEN]$RED Please add the following to your /etc/default/tor and restart service:$RESETCOLOR\n" >&2
+        echo -e "$BLUE#----------------------------------------------------------------------#$RESETCOLOR"
+        echo -e 'RUN_DAEMON="yes"'
+        echo -e "$BLUE#----------------------------------------------------------------------#$RESETCOLOR\n"
+        exit 1
+    fi
 
-	echo -e "$GREEN *$BLUE All traffic was redirected through Tor$RESETCOLOR\n"
-	echo -e "$GREEN[$BLUE i$GREEN ]$BLUE You are under AnonSurf tunnel$RESETCOLOR\n"
+    disable_ipv6
+
+    echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Starting anonymous mode:$RESETCOLOR\n"
+
+    if [ ! -e /var/run/tor/tor.pid ]; then
+        echo -e " $RED*$BLUE Tor is not running! $GREEN starting it $BLUE for you$RESETCOLOR\n" >&2
+        service network-manager force-reload > /dev/null 2>&1
+        killall dnsmasq > /dev/null 2>&1
+        killall nscd > /dev/null 2>&1
+        configure_tor_bridges
+        service tor start
+        sleep 2
+    fi
+
+    log "Saving network state"
+    save_network_state
+
+    iptables -F
+    iptables -t nat -F
+
+    configure_dns
+    spoof_mac
+
+    echo -e " $GREEN*$BLUE Applying iptables Tor redirection rules$RESETCOLOR"
+    log "Applying iptables rules"
+
+    # Allow Tor user output through NAT
+    add_rule -t nat -A OUTPUT -m owner --uid-owner "$TOR_UID" -j RETURN
+
+    # Redirect DNS
+    add_rule -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
+    add_rule -t nat -A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
+    add_rule -t nat -A OUTPUT -p udp -m owner --uid-owner "$TOR_UID" -m udp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
+
+    # Resolve .onion domains mapping 10.192.0.0/10 address space
+    add_rule -t nat -A OUTPUT -p tcp -d 10.192.0.0/10 -j REDIRECT --to-ports "$TOR_PORT"
+    add_rule -t nat -A OUTPUT -p udp -d 10.192.0.0/10 -j REDIRECT --to-ports "$TOR_PORT"
+
+    # Exclude local addresses from NAT
+    for NET in $TOR_EXCLUDE 127.0.0.0/9 127.128.0.0/10; do
+        add_rule -t nat -A OUTPUT -d "$NET" -j RETURN
+    done
+
+    # Redirect all other output through TOR
+    add_rule -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports "$TOR_PORT"
+    add_rule -t nat -A OUTPUT -p udp -j REDIRECT --to-ports "$TOR_PORT"
+    add_rule -t nat -A OUTPUT -p icmp -j REDIRECT --to-ports "$TOR_PORT"
+
+    # Accept already established connections
+    add_rule -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+    # Exclude local addresses from filter
+    for NET in $TOR_EXCLUDE 127.0.0.0/8; do
+        add_rule -A OUTPUT -d "$NET" -j ACCEPT
+    done
+
+    # Allow only tor output
+    add_rule -A OUTPUT -m owner --uid-owner "$TOR_UID" -j ACCEPT
+    add_rule -A OUTPUT -j REJECT
+
+    create_lock
+
+    echo -e "$GREEN *$BLUE All traffic was redirected through Tor$RESETCOLOR\n"
+    echo -e "$GREEN[$BLUE i$GREEN ]$BLUE You are under AnonSurf tunnel$RESETCOLOR\n"
+
+    log "AnonSurf started"
+
+    check_tor_connectivity
 }
-
-
-
 
 
 function stop {
-	# Make sure only root can run our script
-	if [ $(id -u) -ne 0 ]; then
-		echo -e "\n$GREEN[$RED!$GREEN] $RED This script must be run as root$RESETCOLOR\n" >&2
-		exit 1
-	fi
-	echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Stopping anonymous mode:$RESETCOLOR\n"
+    check_root
 
-	iptables -F
-	iptables -t nat -F
-	echo -e " $GREEN*$BLUE Deleted all iptables rules\n$RESETCOLOR"
-	
-	if [ -f /etc/network/iptables.rules ]; then
-		iptables-restore < /etc/network/iptables.rules
-		rm /etc/network/iptables.rules
-		echo -e " $GREEN*$BLUE Iptables rules restored"
-	fi
-	
-	# restore DNS settings
-	if [ "$resolvconf_support" = false ] 
-	then
-		if [ -e /etc/resolv.conf.bak ]; then
-			rm /etc/resolv.conf
-			cp /etc/resolv.conf.bak /etc/resolv.conf
-		fi
-	else
-		mv /etc/resolvconf/resolv.conf.d/head{.bak,}
-		resolvconf -u
-	fi
-	
-	service tor stop
-	
-	echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Reenabling IPv6 services:$RESETCOLOR\n"
+    echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Stopping anonymous mode:$RESETCOLOR\n"
 
-	# reenable IPv6 services
-	enable_ipv6
-	
-	echo -e " $GREEN*$BLUE Anonymous mode stopped$RESETCOLOR\n"
+    restore_network_state
+    restore_mac
+
+    service tor stop
+
+    enable_ipv6
+
+    remove_lock
+
+    echo -e " $GREEN*$BLUE Anonymous mode stopped$RESETCOLOR\n"
+    log "AnonSurf stopped"
 }
+
 
 function change {
-	service tor reload
-	sleep 2
-	echo -e " $GREEN*$BLUE Tor daemon reloaded and forced to change nodes$RESETCOLOR\n"
+    if [ ! -e /var/run/tor/tor.pid ]; then
+        echo -e " $RED*$BLUE Tor is not running. Start AnonSurf first.$RESETCOLOR" >&2
+        log "change request failed: Tor not running"
+        exit 1
+    fi
+    service tor reload
+    sleep 2
+    echo -e " $GREEN*$BLUE Tor daemon reloaded and forced to change nodes$RESETCOLOR\n"
+    log "Tor identity changed"
 }
+
 
 function status {
-	service tor status
+    if [ -f "$LOCK_FILE" ]; then
+        echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE AnonSurf status:$GREEN ACTIVE$RESETCOLOR\n"
+        dns_leak_test
+    else
+        echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE AnonSurf status:$RED INACTIVE$RESETCOLOR\n"
+    fi
+
+    service tor status
+
+    if [ -f "$LOCK_FILE" ]; then
+        local tor_ip
+        tor_ip=$(curl --socks5-hostname "127.0.0.1:$TOR_SOCKS_PORT" -s --max-time 10 "https://check.torproject.org/api/ip" 2>/dev/null | grep -o '"IP":"[^"]*"' | cut -d'"' -f4)
+        if [ -n "$tor_ip" ]; then
+            echo -e "\n $GREEN*$BLUE Tor IP: $YELLOW$tor_ip$RESETCOLOR"
+        fi
+    fi
 }
 
+
+function myip {
+    echo -e "\nMy IP is:\n"
+    sleep 1
+    if [ -f "$LOCK_FILE" ]; then
+        curl --socks5-hostname "127.0.0.1:$TOR_SOCKS_PORT" -s "https://api.ipify.org"
+        echo -e " (routed through Tor)"
+    else
+        curl -s "https://api.ipify.org"
+        echo -e " (direct connection)"
+    fi
+    echo -e "\n\n----------------------------------------------------------------------"
+}
+
+
+function starti2p {
+    echo -e " $GREEN*$BLUE Starting I2P services$RESETCOLOR\n"
+    log "Starting I2P"
+
+    service tor stop
+
+    if [ "$resolvconf_support" = false ]; then
+        cp /etc/resolv.conf /etc/resolv.conf.bak
+        touch /etc/resolv.conf
+    else
+        if [ ! -f /etc/resolvconf/resolv.conf.d/head.bak ]; then
+            cp /etc/resolvconf/resolv.conf.d/head /etc/resolvconf/resolv.conf.d/head.bak
+        fi
+    fi
+
+    configure_dns
+
+    if command -v i2prouter > /dev/null; then
+        i2prouter start
+    else
+        echo -e " $RED*$BLUE i2prouter not found. Install i2p-router package.$RESETCOLOR" >&2
+        log "i2prouter not found"
+        return 1
+    fi
+
+    sleep 2
+
+    if command -v xdg-open > /dev/null; then
+        xdg-open 'http://127.0.0.1:7657/home'
+    fi
+
+    log "I2P started"
+}
+
+
+function stopi2p {
+    echo -e " $GREEN*$BLUE Stopping I2P services$RESETCOLOR\n"
+    log "Stopping I2P"
+
+    if command -v i2prouter > /dev/null; then
+        i2prouter stop
+    fi
+
+    if [ "$resolvconf_support" = false ]; then
+        if [ -f /etc/resolv.conf.bak ]; then
+            rm /etc/resolv.conf
+            cp /etc/resolv.conf.bak /etc/resolv.conf
+            rm /etc/resolv.conf.bak
+        fi
+    else
+        if [ -f /etc/resolvconf/resolv.conf.d/head.bak ]; then
+            mv /etc/resolvconf/resolv.conf.d/head.bak /etc/resolvconf/resolv.conf.d/head
+            resolvconf -u
+        fi
+    fi
+
+    log "I2P stopped"
+}
+
+
+# === Argument Parsing ===
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-kill) NO_KILL=true ;;
+        --no-wipe) NO_WIPE=true ;;
+    esac
+done
+
+
+# === Dispatch ===
+
 case "$1" in
-	start)
-		init
-		start
-	;;
-	stop)
-		init
-		stop
-	;;
-	change)
-		change
-	;;
-	status)
-		status
-	;;
-	myip|ip)
-		ip
-	;;
-	starti2p)
-		starti2p
-	;;
-	stopi2p)
-		stopi2p
-	;;
-	restart)
-		$0 stop
-		sleep 1
-		$0 start
-	;;
-   *)
-echo -e "
-Parrot AnonSurf Module
-	Usage:
-	$RED┌──[$GREEN$USER$YELLOW@$BLUE`hostname`$RED]─[$GREEN$PWD$RED]
-	$RED└──╼ \$$GREEN"" anonsurf $RED{$GREEN""start$RED|$GREEN""stop$RED|$GREEN""restart$RED|$GREEN""change$RED""$RED|$GREEN""status$RED""}
-	
-	$RED start$BLUE -$GREEN Start system-wide anonymous
-		  tunneling under TOR proxy through iptables	  
-	$RED stop$BLUE -$GREEN Reset original iptables settings
-		  and return to clear navigation
-	$RED restart$BLUE -$GREEN Combines \"stop\" and \"start\" options
-	$RED change$BLUE -$GREEN Changes identity restarting TOR
-	$RED status$BLUE -$GREEN Check if AnonSurf is working properly
-	$RED myip$BLUE -$GREEN Show your current IP address $RED(RISKY)$RESETCOLOR
-	----[ I2P related features ]----
-	$RED starti2p$BLUE -$GREEN Start i2p services
-	$RED stopi2p$BLUE -$GREEN Stop i2p services
-	
-$RESETCOLOR" >&2
-exit 1
-;;
+    start)
+        init
+        start
+    ;;
+    stop)
+        stop
+    ;;
+    restart)
+        echo -e " $GREEN*$BLUE Restarting AnonSurf tunnel$RESETCOLOR"
+        log "Restarting AnonSurf"
+        stop
+        sleep 1
+        init
+        start
+    ;;
+    change)
+        change
+    ;;
+    status)
+        status
+    ;;
+    myip|ip)
+        myip
+    ;;
+    starti2p)
+        starti2p
+    ;;
+    stopi2p)
+        stopi2p
+    ;;
+    *)
+        echo -e "\n$GREEN[$BLUE i$GREEN ]$BLUE Usage:$RESETCOLOR\n" >&2
+        echo -e " anonsurf {start|stop|restart|change|status|myip|starti2p|stopi2p}" >&2
+        echo -e "" >&2
+        echo -e " $RED start$BLUE     -$GREEN Start transparent Tor proxy (\`--no-kill\`, \`--no-wipe\`)" >&2
+        echo -e " $RED stop$BLUE      -$GREEN Stop and restore original settings" >&2
+        echo -e " $RED restart$BLUE   -$GREEN Stop then start" >&2
+        echo -e " $RED change$BLUE    -$GREEN Force Tor to change circuit" >&2
+        echo -e " $RED status$BLUE    -$GREEN Show status + DNS leak test" >&2
+        echo -e " $RED myip$BLUE      -$GREEN Show current IP (RISKY)" >&2
+        echo -e " $RED starti2p$BLUE  -$GREEN Start I2P services" >&2
+        echo -e " $RED stopi2p$BLUE   -$GREEN Stop I2P services" >&2
+        echo -e "" >&2
+        echo -e " Optional flags: \`--no-kill\` (skip killing apps), \`--no-wipe\` (skip cache clean)" >&2
+        echo -e "$RESETCOLOR" >&2
+        exit 1
+    ;;
 esac
 
 echo -e $RESETCOLOR

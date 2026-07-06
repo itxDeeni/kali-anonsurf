@@ -1,10 +1,12 @@
 Package: kali-anonsurf
-Version: 1.4.0.0
+Version: 2.0.0.0
 Architecture: all
 Maintainer: Und3rf10w
-Installed-Size: 64
-Depends: secure-delete, tor, i2p
-Recommends: gtkdialog, socat, gufw, proxychains, openvpn
+Installed-Size: 80
+Depends: secure-delete, tor, i2p, curl
+Recommends: gtkdialog, socat, gufw, proxychains, openvpn, bleachbit, macchanger
 Section: net
 Priority: optional
 Description: Parrot stealth and anon scripts, ported to work with Kali Linux
+ Features: transparent Tor proxy, DNS leak protection, MAC spoofing,
+ Tor bridge support, IPv6 disable/enable, I2P integration, RAM wiping

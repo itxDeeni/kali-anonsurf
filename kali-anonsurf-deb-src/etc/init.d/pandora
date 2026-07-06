@@ -17,42 +17,70 @@ set -e
 #                      GNU/GPL v3
 #
 
+PANDORA_STATE_FILE="/var/run/pandora-vm-settings"
+
+function save_vm_settings {
+    echo "Saving current VM settings"
+    cat > "$PANDORA_STATE_FILE" << EOF
+min_free_kbytes=$(cat /proc/sys/vm/min_free_kbytes 2>/dev/null || echo "0")
+drop_caches=$(cat /proc/sys/vm/drop_caches 2>/dev/null || echo "0")
+oom_kill_allocating_task=$(cat /proc/sys/vm/oom_kill_allocating_task 2>/dev/null || echo "0")
+overcommit_memory=$(cat /proc/sys/vm/overcommit_memory 2>/dev/null || echo "0")
+oom_dump_tasks=$(cat /proc/sys/vm/oom_dump_tasks 2>/dev/null || echo "0")
+EOF
+    echo "VM settings saved to $PANDORA_STATE_FILE"
+}
+
+function restore_vm_settings {
+    if [ -f "$PANDORA_STATE_FILE" ]; then
+        echo "Restoring VM settings"
+        source "$PANDORA_STATE_FILE"
+        echo "$min_free_kbytes" > /proc/sys/vm/min_free_kbytes 2>/dev/null || true
+        echo "$drop_caches" > /proc/sys/vm/drop_caches 2>/dev/null || true
+        echo "$oom_kill_allocating_task" > /proc/sys/vm/oom_kill_allocating_task 2>/dev/null || true
+        echo "$overcommit_memory" > /proc/sys/vm/overcommit_memory 2>/dev/null || true
+        echo "$oom_dump_tasks" > /proc/sys/vm/oom_dump_tasks 2>/dev/null || true
+        rm -f "$PANDORA_STATE_FILE"
+        echo "VM settings restored"
+    fi
+}
+
 function bomb {
-	echo "starting Parrot Pandora's box "
-	sleep 5
+    echo "Starting Parrot Pandora's box"
+    sleep 5
+
+    save_vm_settings
+
     echo "Pandora is dropping caches"
     echo 1024 > /proc/sys/vm/min_free_kbytes
     echo 3  > /proc/sys/vm/drop_caches
     echo 1  > /proc/sys/vm/oom_kill_allocating_task
     echo 1  > /proc/sys/vm/overcommit_memory
     echo 0  > /proc/sys/vm/oom_dump_tasks
+
     echo "Pandora is bombing RAM"
     sdmem -fllv
     echo " - RAM bombed"
-    echo "closing Parrot Pandora's box"
+
+    restore_vm_settings
+
+    echo "Closing Parrot Pandora's box"
 }
 
 
-
-
 case "$1" in
-        start)
-                echo "Argument '$1' is not supported, use bomb instead"
-        ;;
-        restart|reload|force-reload)
-                echo "Error: argument '$1' is not supported, use bomb instead"
-        ;;
-        stop)
-#        	if ! grep pandora /proc/cmdline 1> /dev/null
-#        	then echo "Not opening Pandora-bootparam, not enabled from kernel line"
-#        	else
-#              bomb
-#            fi
-              bomb
-        ;;
-        bomb)
-              bomb
-        ;;
-        *)
-              echo "USAGE: pandora bomb"
+    start)
+        echo "Argument '$1' is not supported, use bomb instead"
+    ;;
+    restart|reload|force-reload)
+        echo "Error: argument '$1' is not supported, use bomb instead"
+    ;;
+    stop)
+        bomb
+    ;;
+    bomb)
+        bomb
+    ;;
+    *)
+        echo "USAGE: pandora bomb"
 esac

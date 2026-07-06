@@ -1,1 +1,2 @@
-/etc/init.d/anonsurf $1
+#!/bin/bash
+/etc/init.d/anonsurf "$@"

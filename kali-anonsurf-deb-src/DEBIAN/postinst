@@ -1,6 +1,14 @@
-if [ -e /etc/tor/torrc ]; then
- mv /etc/tor/torrc /etc/tor/torrc.orig
+#!/bin/bash
+set -e
+
+# Create config directory
+mkdir -p /etc/anonsurf
+
+# Handle torrc migration
+if [ -e /etc/tor/torrc ] && [ ! -e /etc/tor/torrc.orig ]; then
+    mv /etc/tor/torrc /etc/tor/torrc.orig
 fi
+
 if [ -e /etc/tor/torrc.anon ]; then
- mv /etc/tor/torrc.anon /etc/tor/torrc
+    mv /etc/tor/torrc.anon /etc/tor/torrc
 fi
